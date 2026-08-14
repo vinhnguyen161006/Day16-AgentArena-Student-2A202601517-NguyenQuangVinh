@@ -59,6 +59,13 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._evidence import (
+    citations_for,
+    claim_doc_id,
+    claim_text,
+    index,
+    norm,
+)
 from harness.middleware import Middleware
 
 
@@ -68,16 +75,37 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict) or ctx.corpus is None:
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        docs = index(ctx)
+        fixed = 0
+        for claim in claims:
+            text = norm(claim_text(claim))
+            if not text:
+                continue
+            cited = claim_doc_id(claim)
+            if cited and docs.supports(cited, text):
+                # Trích dẫn đã đúng: câu khớp nguyên văn một DÒNG của
+                # chính tài liệu được trích. Không đụng vào.
+                continue
+            sources = docs.sources(text)
+            if not sources:
+                # Không tài liệu nào đã đọc chứa câu này -> đây là BỊA
+                # hoặc PARAPHRASE, việc của `critic`. Đừng bịa doc_id:
+                # trỏ bừa vào một tài liệu chỉ đổi `HALLUCINATED` lấy
+                # `UNRETRIEVED`, không lấy lại được điểm nào.
+                continue
+            if sources[0] != cited:
+                # ĐỔI CITATION, GIỮ NGUYÊN CHỮ. Đây là sửa đổi duy nhất
+                # lớp này được phép làm (README §8.2).
+                claim["doc_id"] = sources[0]
+                fixed += 1
+
+        if fixed:
+            ctx.state["reattributed"] = ctx.state.get("reattributed", 0) + fixed
+        report["citations"] = citations_for(claims)
+        return report

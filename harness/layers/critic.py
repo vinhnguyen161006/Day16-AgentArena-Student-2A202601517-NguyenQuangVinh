@@ -70,7 +70,27 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._evidence import (
+    MIN_SUPPORT_CHARS,
+    citations_for,
+    claim_text,
+    index,
+    norm,
+    observed,
+)
 from harness.middleware import Middleware
+
+#: Liên từ mô hình dùng để dán hai nửa của hai tài liệu khác nhau thành
+#: một câu mà không tài liệu nào nói (trường hợp (c) ở docstring).
+FUSE_JOINER = " và "
+
+#: Câu trả lời khi không còn một claim nào đứng vững. Nó thay thế câu
+#: bịa của mô hình — viết lại `answer` là miễn phí trong thang điểm.
+NO_EVIDENCE_ANSWER = (
+    "Không đủ căn cứ trong kho tài liệu nội bộ để trả lời câu hỏi này. "
+    "Những tài liệu đã đọc không chứa dữ liệu xác nhận, nên tôi không suy "
+    "đoán số liệu. Đề nghị liên hệ phòng ban ban hành để có nguồn chính thức."
+)
 
 
 class Critic(Middleware):
@@ -78,17 +98,96 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def _split_fused(self, ctx, text: str):
+        """Tách một câu ghép thành hai nửa, mỗi nửa gắn tài liệu thật.
+
+        Trả về danh sách claim mới, hoặc `[]` nếu không tách được — tức
+        câu này là BỊA chứ không phải ghép.
+
+        Chỗ dán là một trong các lần xuất hiện của `" và "`. Cắt đúng chỗ
+        thì cả hai nửa vẫn là chữ MÔ HÌNH đã viết (một substring của
+        chính câu nó viết ra, nên qua được kiểm tra provenance) và mỗi
+        nửa khớp nguyên văn một DÒNG của HAI tài liệu KHÁC NHAU. Cắt sai
+        thì một nửa vắt qua hai tài liệu và không tài liệu nào chứa nó.
+        """
+        docs = index(ctx)
+        seen = observed(ctx)
+        position = text.find(FUSE_JOINER)
+        while position != -1:
+            left = text[:position].strip()
+            right = text[position + len(FUSE_JOINER):].strip()
+            position = text.find(FUSE_JOINER, position + 1)
+            if len(left) < MIN_SUPPORT_CHARS or len(right) < MIN_SUPPORT_CHARS:
+                continue
+            left_norm, right_norm = norm(left), norm(right)
+            if left_norm not in seen or right_norm not in seen:
+                continue
+            left_docs = docs.sources(left_norm)
+            right_docs = docs.sources(right_norm)
+            pair = next(
+                (
+                    (a, b)
+                    for a in left_docs
+                    for b in right_docs
+                    if a != b
+                ),
+                None,
+            )
+            if pair is None:
+                continue
+            # CẮT BỚT, không sửa chữ: một substring vẫn là một trích dẫn.
+            return [
+                {"text": left, "doc_id": pair[0]},
+                {"text": right, "doc_id": pair[1]},
+            ]
+        return []
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        seen = observed(ctx)
+        kept: list = []
+        dropped = 0
+        split = 0
+        for claim in claims:
+            text = claim_text(claim)
+            if not text.strip():
+                dropped += 1
+                continue
+            if norm(text) in seen:
+                # Câu này CÓ trong bằng chứng agent thật sự đọc. Gắn sai
+                # tài liệu là việc của `citation_checker` (§11), không
+                # phải của lớp này — giữ nguyên, KHÔNG sửa chữ.
+                kept.append(claim)
+                continue
+            halves = self._split_fused(ctx, text)
+            if halves:
+                # Hai nguồn mâu thuẫn bị ghép làm một. Nêu cả hai phía…
+                kept.extend(halves)
+                split += 1
+                # …rồi từ chối chọn hộ: trên brief mâu thuẫn, abstain giữ
+                # trọn 15 điểm honesty và recall lấy theo max(), nên nêu
+                # cả hai phía VÀ abstain không bao giờ thiệt.
+                report["abstain"] = True
+                continue
+            # Không có trong quan sát nào, không tách được -> BỊA. Một
+            # claim bịa mất trọn 15 điểm honesty trên MỌI brief.
+            dropped += 1
+
+        ctx.state["critic_dropped"] = dropped
+        ctx.state["critic_split"] = split
+
+        if not kept:
+            report["claims"] = []
+            report["citations"] = []
+            report["abstain"] = True
+            report["answer"] = NO_EVIDENCE_ANSWER
+            return report
+
+        report["claims"] = kept
+        report["citations"] = citations_for(kept)
+        return report
